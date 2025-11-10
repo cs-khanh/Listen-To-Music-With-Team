@@ -36,6 +36,7 @@ class RoomState {
     this.users = [];
     this.lastUpdatedAt = Date.now(); // ms
     this.leaderId = null; // socket id phát time-update
+    this.messages = [];
   }
 
   addToQueue(video) {
@@ -94,6 +95,24 @@ function stopTicker(roomId) {
     clearInterval(t);
     tickers.delete(roomId);
   }
+}
+
+function createChatMessage({ room, socket, username, text }) {
+  if (!room || !text || typeof text !== 'string') return null;
+  const trimmed = text.trim();
+  if (!trimmed) return null;
+  const message = {
+    id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    userId: socket.id,
+    username: username || 'Anonymous',
+    text: trimmed.slice(0, 1000),
+    createdAt: Date.now()
+  };
+  room.messages.push(message);
+  if (room.messages.length > 100) {
+    room.messages = room.messages.slice(-100);
+  }
+  return message;
 }
 
 // Helper function to extract video ID from URL
@@ -328,6 +347,13 @@ io.on('connection', (socket) => {
       users: room.users
     });
     
+    // Gửi lịch sử chat gần nhất cho user mới
+    if (room.messages && room.messages.length > 0) {
+      socket.emit('chat-history', {
+        messages: room.messages.slice(-50)
+      });
+    }
+
     console.log(`User ${socket.id} joined room ${roomId}`);
   });
 
@@ -347,7 +373,8 @@ io.on('connection', (socket) => {
       title,
       thumbnail,
       currentTime: 0,
-      serverTs: Date.now()
+      serverTs: Date.now(),
+      isPlaying: true
     });
     startTicker(roomId);
   });
@@ -430,7 +457,8 @@ io.on('connection', (socket) => {
         title: nextVideo.title,
         thumbnail: nextVideo.thumbnail,
         currentTime: 0,
-        serverTs: Date.now()
+        serverTs: Date.now(),
+        isPlaying: true
       });
 
       // Broadcast queue update so clients can refresh UI
@@ -509,7 +537,8 @@ io.on('connection', (socket) => {
       title: selected.title,
       thumbnail: selected.thumbnail,
       currentTime: 0,
-      serverTs: Date.now()
+      serverTs: Date.now(),
+      isPlaying: true
     });
     io.to(roomId).emit('queue-updated', { queue: room.queue });
     startTicker(roomId);
@@ -527,6 +556,18 @@ io.on('connection', (socket) => {
       serverTs: nowTs,
       isPlaying: room.isPlaying
     });
+  });
+
+  socket.on('chat-message', ({ roomId, text, username }) => {
+    const room = rooms.get(roomId);
+    if (!room) return;
+
+    const user = room.users.find((u) => u.id === socket.id);
+    const displayName = username || user?.username || 'Anonymous';
+    const message = createChatMessage({ room, socket, username: displayName, text });
+    if (!message) return;
+
+    io.to(roomId).emit('chat-message', message);
   });
 
   socket.on('disconnect', () => {

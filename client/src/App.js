@@ -39,6 +39,9 @@ function App() {
   const [player, setPlayer] = useState(null);
   const [volume, setVolume] = useState(100);
   const [muted, setMuted] = useState(false);
+  const [messages, setMessages] = useState([]);
+  const [chatInput, setChatInput] = useState('');
+  const chatInputRef = useRef(null);
   const getVolumeKeys = (rid) => ({
     VOLUME_KEY: `webmusic_volume_${rid || 'global'}`,
     MUTED_KEY: `webmusic_muted_${rid || 'global'}`,
@@ -77,6 +80,17 @@ function App() {
   const hasSyncedRef = useRef(false); // đánh dấu đã sync time lần đầu khi join
   const isLoadingVideoRef = useRef(false); // đánh dấu đang load video để tránh load nhiều lần
   const expectedStartTimeRef = useRef(null); // lưu expected start time để verify sau khi load
+  const messagesEndRef = useRef(null);
+
+  useEffect(() => {
+    if (messagesEndRef.current) {
+      try {
+        messagesEndRef.current.scrollIntoView({ behavior: 'smooth', block: 'end' });
+      } catch (e) {
+        // ignore scroll errors (e.g. element not attached)
+      }
+    }
+  }, [messages]);
 
   // Helper: cố gắng autoplay với fallback mute/unmute để bypass browser autoplay policy
   const tryAutoPlay = () => {
@@ -239,6 +253,9 @@ function App() {
       console.log('Dynamic socket URL:', dynamicSocketURL);
       console.log('Using socket URL:', dynamicSocketURL);
       
+      setMessages([]);
+      setChatInput('');
+
       const newSocket = io(dynamicSocketURL, {
         transports: ['websocket', 'polling'], // Thử WebSocket trước, fallback về polling
         upgrade: true,
@@ -296,6 +313,57 @@ function App() {
           // video-play sẽ gửi currentTime đúng, nên pending sẽ được set từ video-play
           // Không cần tính ở đây
         }
+
+        // Fallback: nếu sau một nhịp ngắn không nhận được video-play, tự load dựa trên room-state
+        if (state.currentVideo) {
+          const fallbackCheckTs = Date.now();
+          setTimeout(() => {
+            try {
+              const hasRecentVideoPlay = (Date.now() - lastVideoPlayAtRef.current) < 800;
+              if (hasRecentVideoPlay) return; // đã có video-play
+              if (isLoadingVideoRef.current) return;
+              const video = state.currentVideo;
+              const base = typeof state.baseTime === 'number' ? state.baseTime : 0;
+              const serverTs = state.serverTs || Date.now();
+              const elapsed = Math.max(0, (Date.now() - serverTs) / 1000);
+              const shouldPlay = !!state.isPlaying;
+              const startSeconds = shouldPlay ? base + elapsed : base;
+              console.log('[ROOM-STATE Fallback] No video-play received, loading manually', {
+                since: Date.now() - fallbackCheckTs,
+                startSeconds,
+                base,
+                elapsed,
+                shouldPlay
+              });
+              // Mark loading to avoid races
+              isLoadingVideoRef.current = true;
+              setCurrentVideo({ videoId: video.videoId, title: video.title, thumbnail: video.thumbnail });
+              expectedStartTimeRef.current = startSeconds;
+              if (playerRef.current) {
+                try {
+                  playerRef.current.loadVideoById({ videoId: video.videoId, startSeconds });
+                  videoEndedEmittedRef.current = false;
+                  lastSeekTimeRef.current = Date.now();
+                } catch (e) {
+                  console.error('[ROOM-STATE Fallback] loadVideoById error', e);
+                  isLoadingVideoRef.current = false;
+                }
+              } else {
+                // Player chưa sẵn sàng: set pending để onReady xử lý
+                setPendingVideo({ videoId: video.videoId, title: video.title, thumbnail: video.thumbnail, currentTime: startSeconds, isPlaying: shouldPlay, serverTs });
+              }
+              // Try to play if shouldPlay
+              if (shouldPlay) {
+                setIsPlaying(true);
+                tryAutoPlay();
+              } else {
+                setIsPlaying(false);
+              }
+            } catch (e) {
+              console.error('[ROOM-STATE Fallback] error', e);
+            }
+          }, 800);
+        }
       });
       newSocket.on('leader-changed', ({ leaderId: lid }) => {
         setLeaderId(lid);
@@ -304,6 +372,24 @@ function App() {
       newSocket.on('users-updated', ({ users }) => {
         console.log('Users updated:', users);
         setUsers(users);
+      });
+
+      newSocket.on('chat-history', ({ messages: history }) => {
+        if (Array.isArray(history)) {
+          setMessages(history);
+        } else {
+          setMessages([]);
+        }
+      });
+
+      newSocket.on('chat-message', (message) => {
+        if (!message || !message.id) return;
+        setMessages((prev) => {
+          if (prev.some((msg) => msg.id === message.id)) {
+            return prev;
+          }
+          return [...prev, message];
+        });
       });
 
       newSocket.on('video-play', ({ videoId, title, thumbnail, currentTime, serverTs, isPlaying: serverIsPlaying }) => {
@@ -1148,6 +1234,8 @@ function App() {
     setUsers([]);
     setRoomId('');
     setUsername('');
+    setMessages([]);
+    setChatInput('');
   };
 
   const handleSearch = async (e) => {
@@ -1187,6 +1275,54 @@ function App() {
       } else {
         alert('Lỗi khi tìm kiếm. Vui lòng thử lại sau.');
       }
+    }
+  };
+
+  const formatChatTime = (timestamp) => {
+    if (!timestamp) return '';
+    try {
+      return new Date(timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    } catch (error) {
+      return '';
+    }
+  };
+
+  const sendChatMessage = () => {
+    if (!socket || !roomId) return;
+    const trimmed = chatInput.trim();
+    if (!trimmed) return;
+    socket.emit('chat-message', {
+      roomId,
+      text: trimmed,
+      username: username || 'Anonymous',
+    });
+    setChatInput('');
+    // Reset height after send
+    if (chatInputRef.current) {
+      chatInputRef.current.style.height = '40px';
+    }
+  };
+  const autoResizeChat = (el) => {
+    if (!el) return;
+    el.style.height = 'auto';
+    const maxHeight = 160; // cap growth
+    el.style.height = Math.min(el.scrollHeight, maxHeight) + 'px';
+  };
+
+  const handleChatChange = (e) => {
+    setChatInput(e.target.value);
+    autoResizeChat(e.target);
+  };
+
+  const handleChatSubmit = (e) => {
+    e.preventDefault();
+    sendChatMessage();
+  };
+
+  const handleChatKeyDown = (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      sendChatMessage();
     }
   };
 
@@ -1306,6 +1442,49 @@ function App() {
               />
               <span className="volume-value">{volume}%</span>
             </div>
+          </div>
+
+          <div className="chat-section">
+            <h2>💬 Chat</h2>
+            <div className="chat-messages">
+              {messages.length === 0 ? (
+                <p className="chat-empty">Chưa có tin nhắn nào. Hãy là người mở đầu nhé!</p>
+              ) : (
+                messages.map((message) => {
+                  const isOwn = message.userId === mySocketId;
+                  return (
+                    <div
+                      key={message.id}
+                      className={`chat-message${isOwn ? ' chat-message-own' : ''}`}
+                    >
+                      <div className="chat-message-meta">
+                        <span className="chat-message-user">{isOwn ? 'Bạn' : message.username || 'Anonymous'}</span>
+                        <span className="chat-message-time">{formatChatTime(message.createdAt)}</span>
+                      </div>
+                      <div className="chat-message-text">{message.text}</div>
+                    </div>
+                  );
+                })
+              )}
+              <div ref={messagesEndRef} />
+            </div>
+            <form className="chat-form" onSubmit={handleChatSubmit}>
+              <textarea
+                ref={chatInputRef}
+                value={chatInput}
+                onChange={handleChatChange}
+                onKeyDown={handleChatKeyDown}
+                placeholder="Nhập tin nhắn..."
+                className="chat-input"
+                maxLength={1000}
+                disabled={!socket}
+                rows={1}
+                style={{height: '40px'}}
+              />
+              <button type="submit" className="btn-primary" disabled={!socket || !chatInput.trim()}>
+                Gửi
+              </button>
+            </form>
           </div>
         </div>
 
