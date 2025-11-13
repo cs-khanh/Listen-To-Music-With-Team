@@ -73,6 +73,7 @@ function App() {
   const initSyncedRef = useRef(false); // tránh load lại khi join sau
   const [leaderId, setLeaderId] = useState(null);
   const [mySocketId, setMySocketId] = useState(null);
+  const mySocketIdRef = useRef(null); // Ref để lưu socket.id cho việc so sánh trong handlers
   const videoEndedEmittedRef = useRef(false); // tránh emit video-ended nhiều lần
   const lastVolumeCheckRef = useRef({ volume: 100, muted: false, lastCheck: 0 }); // để tránh volume jitter
   const volumeApplyTimeoutRef = useRef(null); // debounce cho applyVolumeSettings
@@ -81,6 +82,112 @@ function App() {
   const isLoadingVideoRef = useRef(false); // đánh dấu đang load video để tránh load nhiều lần
   const expectedStartTimeRef = useRef(null); // lưu expected start time để verify sau khi load
   const messagesEndRef = useRef(null);
+  const audioContextRef = useRef(null);
+
+  // Unlock AudioContext khi user tương tác với page (để bypass browser autoplay policy)
+  useEffect(() => {
+    const unlockAudio = () => {
+      if (!audioContextRef.current) {
+        try {
+          const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+          if (AudioContextClass) {
+            audioContextRef.current = new AudioContextClass();
+            console.log('[AUDIO] AudioContext created and unlocked');
+          }
+        } catch (e) {
+          console.warn('[AUDIO] Could not create AudioContext:', e);
+        }
+      } else if (audioContextRef.current.state === 'suspended') {
+        audioContextRef.current.resume().then(() => {
+          console.log('[AUDIO] AudioContext resumed');
+        }).catch((e) => {
+          console.warn('[AUDIO] Could not resume AudioContext:', e);
+        });
+      }
+    };
+
+    // Unlock khi user click, touch, hoặc keypress (không dùng once để có thể unlock nhiều lần)
+    const events = ['click', 'touchstart', 'keydown'];
+    events.forEach(event => {
+      document.addEventListener(event, unlockAudio);
+    });
+
+    return () => {
+      events.forEach(event => {
+        document.removeEventListener(event, unlockAudio);
+      });
+    };
+  }, []);
+
+  // Unlock AudioContext khi join room (nếu đã có user interaction trước đó)
+  useEffect(() => {
+    if (joined && audioContextRef.current && audioContextRef.current.state === 'suspended') {
+      audioContextRef.current.resume().then(() => {
+        console.log('[AUDIO] AudioContext resumed after joining room');
+      }).catch((e) => {
+        console.warn('[AUDIO] Could not resume AudioContext after joining:', e);
+      });
+    }
+  }, [joined]);
+
+  // Hàm phát âm thanh thông báo khi có tin nhắn mới
+  const playMessageSound = () => {
+    try {
+      // Sử dụng AudioContext đã được unlock
+      let ctx = audioContextRef.current;
+      
+      // Nếu chưa có AudioContext, tạo mới
+      if (!ctx) {
+        const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+        if (!AudioContextClass) {
+          console.warn('[MESSAGE-SOUND] Web Audio API not supported');
+          return;
+        }
+        ctx = new AudioContextClass();
+        audioContextRef.current = ctx;
+      }
+      
+      // Resume AudioContext nếu bị suspended
+      if (ctx.state === 'suspended') {
+        ctx.resume().then(() => {
+          console.log('[MESSAGE-SOUND] AudioContext resumed');
+          playSound(ctx);
+        }).catch((e) => {
+          console.warn('[MESSAGE-SOUND] Could not resume AudioContext:', e);
+        });
+      } else {
+        playSound(ctx);
+      }
+      
+      function playSound(audioCtx) {
+        try {
+          const oscillator = audioCtx.createOscillator();
+          const gainNode = audioCtx.createGain();
+          
+          oscillator.connect(gainNode);
+          gainNode.connect(audioCtx.destination);
+          
+          // Tạo âm thanh "ping" ngắn gọn, dễ nghe hơn
+          oscillator.frequency.value = 2000; // Tần số vừa phải
+          oscillator.type = 'sine';
+          
+          // Envelope để âm thanh mượt hơn
+          gainNode.gain.setValueAtTime(0, audioCtx.currentTime);
+          gainNode.gain.linearRampToValueAtTime(0.5, audioCtx.currentTime + 0.01);
+          gainNode.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.2);
+          
+          oscillator.start(audioCtx.currentTime);
+          oscillator.stop(audioCtx.currentTime + 0.2);
+          
+          console.log('[MESSAGE-SOUND] ✅ Sound played successfully');
+        } catch (e) {
+          console.error('[MESSAGE-SOUND] Error playing sound:', e);
+        }
+      }
+    } catch (e) {
+      console.error('[MESSAGE-SOUND] Error with AudioContext:', e);
+    }
+  };
 
   useEffect(() => {
     if (messagesEndRef.current) {
@@ -189,19 +296,31 @@ function App() {
     }
   }, []);
 
-  // Avoid broadcasting pause when tab hidden and try to resume when visible
+  // Tất cả chức năng vẫn hoạt động khi tab hidden (video phát, sync, events, etc.)
+  // Chỉ resume video khi tab visible lại nếu video bị pause bởi browser
   useEffect(() => {
     const handleVisibility = () => {
       isTabHiddenRef.current = document.hidden;
-          if (!document.hidden && playerRef.current) {
-            try {
-              const state = playerRef.current.getPlayerState();
-              if (isPlaying && state !== window.YT.PlayerState.PLAYING) {
-                playerRef.current.playVideo();
-              }
-              // Volume will be synced by the volume sync effect
-            } catch (e) {}
+      
+      if (document.hidden) {
+        console.log('[VISIBILITY] Tab hidden - all functions continue to work (video, sync, events)');
+        // Tất cả chức năng vẫn hoạt động bình thường khi tab hidden
+      } else {
+        console.log('[VISIBILITY] Tab visible - checking if video needs resume');
+        if (playerRef.current) {
+          try {
+            const state = playerRef.current.getPlayerState();
+            // Nếu video đang phát (theo state) nhưng player bị pause bởi browser, resume lại
+            if (isPlaying && state !== window.YT.PlayerState.PLAYING && state !== window.YT.PlayerState.BUFFERING) {
+              console.log('[VISIBILITY] Resuming video playback (was paused by browser)');
+              playerRef.current.playVideo();
+            }
+            // Volume will be synced by the volume sync effect
+          } catch (e) {
+            console.error('[VISIBILITY] Error resuming video', e);
           }
+        }
+      }
     };
     document.addEventListener('visibilitychange', handleVisibility);
     return () => document.removeEventListener('visibilitychange', handleVisibility);
@@ -272,7 +391,10 @@ function App() {
 
       newSocket.on('connect', () => {
         console.log('Socket.io connected!', newSocket.id);
-        setMySocketId(newSocket.id);
+        const socketId = newSocket.id;
+        setMySocketId(socketId);
+        mySocketIdRef.current = socketId; // Lưu vào ref để dùng trong handlers (luôn có giá trị mới nhất)
+        console.log('[SOCKET] Socket ID set:', socketId);
         console.log('Joining room:', roomId, 'as:', username || 'Anonymous');
         newSocket.emit('join-room', { roomId, username: username || 'Anonymous' });
         // đánh dấu cần sync lần đầu
@@ -384,6 +506,32 @@ function App() {
 
       newSocket.on('chat-message', (message) => {
         if (!message || !message.id) return;
+        
+        // Phát âm thanh nếu tin nhắn không phải của chính mình
+        // CHỈ so sánh userId (socket.id) vì nó là unique
+        // KHÔNG so sánh username vì nhiều user có thể có cùng username "Anonymous"
+        // Sử dụng ref để đảm bảo so sánh với giá trị mới nhất
+        const currentSocketId = mySocketIdRef.current || newSocket.id;
+        const isOwnMessage = message.userId === currentSocketId;
+        
+        console.log('[CHAT-MESSAGE] Received message', { 
+          messageId: message.id, 
+          messageUserId: message.userId, 
+          currentSocketId,
+          mySocketIdState: mySocketId,
+          username: message.username, 
+          myUsername: username,
+          isOwnMessage,
+          socketId: newSocket.id
+        });
+        
+        if (!isOwnMessage) {
+          console.log('[CHAT-MESSAGE] ✅ Playing sound for incoming message (not own)');
+          playMessageSound();
+        } else {
+          console.log('[CHAT-MESSAGE] ❌ Own message, skipping sound');
+        }
+        
         setMessages((prev) => {
           if (prev.some((msg) => msg.id === message.id)) {
             return prev;
@@ -393,17 +541,24 @@ function App() {
       });
 
       newSocket.on('video-play', ({ videoId, title, thumbnail, currentTime, serverTs, isPlaying: serverIsPlaying }) => {
-        console.log('[VIDEO-PLAY] incoming', { videoId, currentTime, serverTs, serverIsPlaying, localIsPlaying: isPlaying });
+        console.log('[CLIENT] ========== VIDEO-PLAY EVENT RECEIVED ==========');
+        console.log('[VIDEO-PLAY] incoming', { videoId, title, currentTime, serverTs, serverIsPlaying, localIsPlaying: isPlaying });
         // Nếu đây là play từ local (user này click "Phát ngay"), skip để tránh duplicate
         if (isLocalPlayRef.current) {
           isLocalPlayRef.current = false;
           return;
         }
         // debounce: nếu vừa xử lý video-play trong 300ms, bỏ qua để tránh reload
+        // NHƯNG: Nếu videoId khác với video hiện tại, không debounce (cần load video mới ngay)
         const now = Date.now();
-        if (now - lastVideoPlayAtRef.current < 300) {
-          console.log('[VIDEO-PLAY] debounced');
+        const isVideoChanged = !currentVideo || currentVideo.videoId !== videoId;
+        const timeSinceLastPlay = now - lastVideoPlayAtRef.current;
+        if (!isVideoChanged && timeSinceLastPlay < 300) {
+          console.log('[VIDEO-PLAY] debounced (same video, recent play)', { timeSinceLastPlay, videoId });
           return;
+        }
+        if (isVideoChanged) {
+          console.log('[VIDEO-PLAY] Video changed, skipping debounce', { oldVideoId: currentVideo?.videoId, newVideoId: videoId });
         }
         lastVideoPlayAtRef.current = now;
         
@@ -425,21 +580,43 @@ function App() {
         } else {
           // Kiểm tra video đã load chưa
           let loadedId = null;
+          let currentState = null;
           try {
             const vd = playerRef.current.getVideoData && playerRef.current.getVideoData();
             loadedId = vd && vd.video_id ? vd.video_id : null;
+            currentState = playerRef.current.getPlayerState ? playerRef.current.getPlayerState() : null;
           } catch (e) {}
           
+          // Kiểm tra xem videoId có khác với video hiện tại trong state không
+          const isVideoChanged = !currentVideo || currentVideo.videoId !== videoId;
+          
           // Load lại video nếu:
-          // 1. Video khác (luôn load video mới)
-          // 2. Hoặc chưa sync (hasSyncedRef = false) - đây là user mới join
-          const shouldLoad = !loadedId || loadedId !== videoId || !hasSyncedRef.current;
+          // 1. Video khác với video hiện tại trong state (luôn load video mới)
+          // 2. Video khác với video đã load trong player
+          // 3. Hoặc chưa sync (hasSyncedRef = false) - đây là user mới join
+          // 4. Hoặc player đang ở state ENDED (cần load video mới)
+          const shouldLoad = isVideoChanged || !loadedId || loadedId !== videoId || !hasSyncedRef.current || currentState === window.YT.PlayerState.ENDED;
           
-          console.log('[VIDEO-PLAY] Checking if should load', { loadedId, videoId, shouldLoad, isLoadingVideo: isLoadingVideoRef.current, hasSynced: hasSyncedRef.current });
+          console.log('[VIDEO-PLAY] Checking if should load', { 
+            currentVideoId: currentVideo?.videoId, 
+            newVideoId: videoId, 
+            loadedId, 
+            isVideoChanged,
+            shouldLoad, 
+            isLoadingVideo: isLoadingVideoRef.current, 
+            hasSynced: hasSyncedRef.current, 
+            currentState 
+          });
           
-          // Nếu video khác, reset tất cả flags để có thể load video mới
-          if (loadedId && loadedId !== videoId) {
-            console.log('[VIDEO-PLAY] Video changed, resetting all flags');
+          // Nếu video khác hoặc player đang ở state ENDED, reset tất cả flags để có thể load video mới
+          if (isVideoChanged || (loadedId && loadedId !== videoId) || currentState === window.YT.PlayerState.ENDED) {
+            console.log('[VIDEO-PLAY] Video changed or player ended, resetting all flags', { 
+              isVideoChanged, 
+              loadedId, 
+              videoId, 
+              currentState,
+              currentVideoId: currentVideo?.videoId 
+            });
             isLoadingVideoRef.current = false;
             hasSyncedRef.current = false;
             expectedStartTimeRef.current = null;
@@ -483,10 +660,11 @@ function App() {
             
             // Load video với startSeconds đã tính, chỉ load một lần duy nhất
             try {
-              console.log('[VIDEO-PLAY] Calling loadVideoById with', { videoId, startSeconds: start, calculated: start });
+              console.log('[VIDEO-PLAY] ✅ Calling loadVideoById with', { videoId, title, startSeconds: start, shouldPlay, serverIsPlaying });
               // Lưu expected time để verify sau khi load
               expectedStartTimeRef.current = start;
               playerRef.current.loadVideoById({ videoId, startSeconds: start });
+              console.log('[VIDEO-PLAY] ✅ loadVideoById called successfully');
               initSyncedRef.current = true;
               videoEndedEmittedRef.current = false; // Reset flag when loading new video
               lastSeekTimeRef.current = Date.now(); // Đánh dấu đã seek để tránh seek lại
@@ -621,6 +799,7 @@ function App() {
             }
           } else {
             // Đã cùng video và đã sync, chỉ cập nhật playing state
+            console.log('[VIDEO-PLAY] Video already loaded and synced, updating playing state only', { shouldPlay, loadedId, videoId });
             if (shouldPlay) {
               setIsPlaying(true);
               tryAutoPlay();
@@ -629,6 +808,7 @@ function App() {
             }
           }
         }
+        console.log('[CLIENT] ===========================================');
       });
 
       newSocket.on('video-pause', () => {
@@ -887,14 +1067,62 @@ function App() {
             } catch (_) {}
           },
           onStateChange: (event) => {
+            // Log tất cả state changes để debug
+            const stateNames = {
+              [window.YT.PlayerState.ENDED]: 'ENDED',
+              [window.YT.PlayerState.PLAYING]: 'PLAYING',
+              [window.YT.PlayerState.PAUSED]: 'PAUSED',
+              [window.YT.PlayerState.BUFFERING]: 'BUFFERING',
+              [window.YT.PlayerState.CUED]: 'CUED',
+              [window.YT.PlayerState.UNSTARTED]: 'UNSTARTED'
+            };
+            console.log('[ONSTATECHANGE] State changed:', stateNames[event.data] || 'UNKNOWN', event.data, { 
+              videoId: currentVideo?.videoId,
+              isPlaying,
+              isLeader: mySocketId === leaderId
+            });
+            
             if (event.data === window.YT.PlayerState.PLAYING) {
               setIsPlaying(true);
               videoEndedEmittedRef.current = false; // Reset flag when new video starts playing
               isLoadingVideoRef.current = false; // Reset loading flag khi video đã playing
-              if (socket && !isSyncingRef.current && !isTabHiddenRef.current) {
+              // Luôn emit resume-video để sync với server, kể cả khi tab hidden
+              if (socket && !isSyncingRef.current) {
                 socket.emit('resume-video', { roomId });
               }
               // Volume will be synced by the volume sync effect, no need to apply here
+            } else if (event.data === window.YT.PlayerState.UNSTARTED) {
+              // Video mới được load (thường xảy ra sau khi video cũ kết thúc)
+              console.log('[ONSTATECHANGE] Video UNSTARTED (new video loaded)', { isPlaying });
+              videoEndedEmittedRef.current = false;
+              // Nếu isPlaying = true, tự động play video mới
+              if (isPlaying && playerRef.current) {
+                setTimeout(() => {
+                  try {
+                    if (playerRef.current) {
+                      const state = playerRef.current.getPlayerState ? playerRef.current.getPlayerState() : -1;
+                      if (state === window.YT.PlayerState.UNSTARTED || state === window.YT.PlayerState.CUED) {
+                        console.log('[ONSTATECHANGE] UNSTARTED - auto-playing new video', { state, isPlaying });
+                        isLoadingVideoRef.current = false;
+                        const currentMuted = muted || volume === 0;
+                        if (!currentMuted && volume > 0) {
+                          playerRef.current.mute();
+                          playerRef.current.playVideo();
+                          setTimeout(() => {
+                            if (playerRef.current && !currentMuted && volume > 0) {
+                              playerRef.current.unMute();
+                            }
+                          }, 200);
+                        } else {
+                          playerRef.current.playVideo();
+                        }
+                      }
+                    }
+                  } catch (e) {
+                    console.error('[ONSTATECHANGE] Error playing video in UNSTARTED', e);
+                  }
+                }, 100);
+              }
             } else if (event.data === window.YT.PlayerState.BUFFERING || event.data === window.YT.PlayerState.CUED) {
               // Reset flag when new video is loading
               videoEndedEmittedRef.current = false;
@@ -977,20 +1205,69 @@ function App() {
               // Volume will be synced by the volume sync effect, no need to apply here
               // Không cần sync-request nữa - đã sync một lần khi join hoặc khi video-play
             } else if (event.data === window.YT.PlayerState.PAUSED) {
+              // Luôn emit pause-video để sync với server, kể cả khi tab hidden
               setIsPlaying(false);
-              if (socket && !isSyncingRef.current && !isTabHiddenRef.current) {
+              if (socket && !isSyncingRef.current) {
                 socket.emit('pause-video', { roomId });
               }
             } else if (event.data === window.YT.PlayerState.ENDED) {
               // Chỉ leader thông báo video-ended để server quyết định next
-              console.log('[VIDEO-ENDED] Player state ENDED', { mySocketId, leaderId, isLeader: mySocketId === leaderId });
-              if (socket && mySocketId && leaderId && mySocketId === leaderId && !videoEndedEmittedRef.current) {
-                console.log('[VIDEO-ENDED] Emitting video-ended to server');
-                videoEndedEmittedRef.current = true;
-                socket.emit('video-ended', { roomId });
-              } else {
-                console.log('[VIDEO-ENDED] Not leader or already emitted, skipping');
+              console.log('[CLIENT] ========== VIDEO-ENDED STATE ==========');
+              try {
+                // Ngăn video tự động loop lại - dừng video ngay khi kết thúc
+                if (playerRef.current && playerRef.current.stopVideo) {
+                  try {
+                    playerRef.current.stopVideo();
+                    console.log('[VIDEO-ENDED] Stopped video to prevent auto-loop');
+                  } catch (e) {
+                    console.warn('[VIDEO-ENDED] Error stopping video', e);
+                  }
+                }
+                
+                let currentTime = 0;
+                let duration = 0;
+                try {
+                  if (playerRef.current?.getCurrentTime) {
+                    const ct = playerRef.current.getCurrentTime();
+                    currentTime = typeof ct === 'number' && !isNaN(ct) ? ct : 0;
+                  }
+                  if (playerRef.current?.getDuration) {
+                    const dur = playerRef.current.getDuration();
+                    duration = typeof dur === 'number' && !isNaN(dur) ? dur : 0;
+                  }
+                } catch (e) {
+                  console.warn('[VIDEO-ENDED] Error getting video time info:', e);
+                }
+                console.log('[VIDEO-ENDED] 🎬 PLAYER STATE ENDED!', { 
+                  videoId: currentVideo?.videoId, 
+                  title: currentVideo?.title,
+                  currentTime: currentTime.toFixed(2), 
+                  duration: duration.toFixed(2),
+                  mySocketId, 
+                  leaderId, 
+                  isLeader: mySocketId === leaderId, 
+                  alreadyEmitted: videoEndedEmittedRef.current,
+                  queueLength: queue.length,
+                  queueVideos: queue.map(v => ({ id: v.videoId, title: v.title }))
+                });
+                if (socket && mySocketId && leaderId && mySocketId === leaderId && !videoEndedEmittedRef.current) {
+                  console.log('[VIDEO-ENDED] ✅ Emitting video-ended to server, roomId:', roomId);
+                  videoEndedEmittedRef.current = true;
+                  socket.emit('video-ended', { roomId });
+                  console.log('[VIDEO-ENDED] ✅ video-ended event emitted');
+                } else {
+                  console.log('[VIDEO-ENDED] ❌ Not leader or already emitted, skipping', { 
+                    hasSocket: !!socket, 
+                    mySocketId, 
+                    leaderId, 
+                    isLeader: mySocketId === leaderId, 
+                    alreadyEmitted: videoEndedEmittedRef.current 
+                  });
+                }
+              } catch (e) {
+                console.error('[VIDEO-ENDED] Error getting video info', e);
               }
+              console.log('[CLIENT] ===========================================');
             }
           },
         },
@@ -1190,9 +1467,20 @@ function App() {
 
   // Check for video ended periodically (fallback if onStateChange doesn't fire)
   useEffect(() => {
-    if (!playerRef.current || !socket || !joined) return;
-    if (!leaderId || !mySocketId || mySocketId !== leaderId) return;
-    if (!currentVideo) return;
+    if (!playerRef.current || !socket || !joined) {
+      console.log('[VIDEO-ENDED-CHECK] Interval not started: missing player/socket/joined');
+      return;
+    }
+    if (!leaderId || !mySocketId || mySocketId !== leaderId) {
+      console.log('[VIDEO-ENDED-CHECK] Interval not started: not leader', { mySocketId, leaderId });
+      return;
+    }
+    if (!currentVideo) {
+      console.log('[VIDEO-ENDED-CHECK] Interval not started: no current video');
+      return;
+    }
+    
+    console.log('[VIDEO-ENDED-CHECK] Starting interval check for video ended');
     
     const checkEndedInterval = setInterval(() => {
       try {
@@ -1201,20 +1489,68 @@ function App() {
           const currentTime = playerRef.current.getCurrentTime ? playerRef.current.getCurrentTime() : 0;
           const duration = playerRef.current.getDuration ? playerRef.current.getDuration() : 0;
           
+          // Đảm bảo currentTime và duration là số hợp lệ
+          const safeCurrentTime = typeof currentTime === 'number' && !isNaN(currentTime) ? currentTime : 0;
+          const safeDuration = typeof duration === 'number' && !isNaN(duration) ? duration : 0;
+          
+          // Log thông tin video mỗi 5 giây để debug (hoặc khi gần kết thúc)
+          const shouldLog = safeDuration > 0 && (safeCurrentTime >= safeDuration - 5 || Math.floor(safeCurrentTime) % 5 === 0);
+          if (shouldLog) {
+            console.log('[VIDEO-ENDED-CHECK] Status check', { 
+              videoId: currentVideo?.videoId, 
+              title: currentVideo?.title,
+              currentTime: safeCurrentTime.toFixed(2), 
+              duration: safeDuration.toFixed(2), 
+              remaining: safeDuration > 0 ? (safeDuration - safeCurrentTime).toFixed(2) : 'N/A',
+              state, 
+              stateName: state === window.YT.PlayerState.ENDED ? 'ENDED' : 
+                        state === window.YT.PlayerState.PLAYING ? 'PLAYING' :
+                        state === window.YT.PlayerState.PAUSED ? 'PAUSED' :
+                        state === window.YT.PlayerState.CUED ? 'CUED' :
+                        state === window.YT.PlayerState.BUFFERING ? 'BUFFERING' : 'UNKNOWN',
+              isPlaying, 
+              isLeader: mySocketId === leaderId,
+              queueLength: queue.length,
+              alreadyEmitted: videoEndedEmittedRef.current
+            });
+          }
+          
           // Check if video ended (state is ENDED or currentTime >= duration - 0.5s)
-          if (!videoEndedEmittedRef.current && (state === window.YT.PlayerState.ENDED || (duration > 0 && currentTime >= duration - 0.5 && isPlaying))) {
-            console.log('[VIDEO-ENDED-CHECK] Video ended detected', { state, currentTime, duration });
+          const isEnded = state === window.YT.PlayerState.ENDED;
+          const isNearEnd = safeDuration > 0 && safeCurrentTime >= safeDuration - 0.5 && isPlaying;
+          
+          if (!videoEndedEmittedRef.current && (isEnded || isNearEnd)) {
+            console.log('[CLIENT] ========== VIDEO-ENDED-CHECK (INTERVAL) ==========');
+            console.log('[VIDEO-ENDED-CHECK] 🎬 VIDEO ENDED DETECTED!', { 
+              videoId: currentVideo?.videoId, 
+              title: currentVideo?.title,
+              state, 
+              stateName: isEnded ? 'ENDED' : 'NEAR_END',
+              currentTime: safeCurrentTime.toFixed(2), 
+              duration: safeDuration.toFixed(2), 
+              isPlaying, 
+              isLeader: mySocketId === leaderId,
+              queueLength: queue.length,
+              queueVideos: queue.map(v => ({ id: v.videoId, title: v.title })),
+              isEnded,
+              isNearEnd
+            });
             videoEndedEmittedRef.current = true;
             socket.emit('video-ended', { roomId });
+            console.log('[VIDEO-ENDED-CHECK] ✅ video-ended event emitted from interval check');
+            console.log('[CLIENT] ===================================================');
           }
         }
       } catch (e) {
-        // Ignore errors
+        console.error('[VIDEO-ENDED-CHECK] Error checking video ended', e);
       }
     }, 1000); // Check every second
     
-    return () => clearInterval(checkEndedInterval);
-  }, [player, socket, joined, roomId, currentVideo, leaderId, mySocketId, isPlaying]);
+    return () => {
+      console.log('[VIDEO-ENDED-CHECK] Stopping interval check');
+      clearInterval(checkEndedInterval);
+    };
+  }, [player, socket, joined, roomId, currentVideo, leaderId, mySocketId, isPlaying, queue]);
 
   const handleJoinRoom = (e) => {
     e.preventDefault();
@@ -1360,7 +1696,7 @@ function App() {
       <div className="app">
         <div className="join-room-container">
           <div className="join-room-card">
-            <h1>🎵 WebMusic</h1>
+            <h1>♪ WebMusic</h1>
             <p className="subtitle">Nghe nhạc cùng nhau trong room</p>
             <form onSubmit={handleJoinRoom} className="join-form">
               <input
@@ -1396,7 +1732,7 @@ function App() {
     <div className="app">
       <header className="app-header">
         <div className="header-content">
-          <h1>🎵 WebMusic</h1>
+          <h1>♪ WebMusic</h1>
           <div className="room-info">
             <span className="room-id">Room: {roomId}</span>
             <span className="username">{username || 'Anonymous'}</span>
@@ -1424,7 +1760,7 @@ function App() {
           <div className="controls">
             {queue.length > 0 && (
               <button onClick={handleNextVideo} className="btn-primary">
-                ⏭️ Bài tiếp theo
+                ⏭ Bài tiếp theo
               </button>
             )}
             <div className="volume-controls">
@@ -1445,7 +1781,7 @@ function App() {
           </div>
 
           <div className="chat-section">
-            <h2>💬 Chat</h2>
+            <h2>Chat</h2>
             <div className="chat-messages">
               {messages.length === 0 ? (
                 <p className="chat-empty">Chưa có tin nhắn nào. Hãy là người mở đầu nhé!</p>
@@ -1488,16 +1824,46 @@ function App() {
           </div>
         </div>
 
+        <div className="queue-section">
+          <h2>Danh sách phát ({queue.length})</h2>
+          {queue.length === 0 ? (
+            <p className="empty-queue">Danh sách trống</p>
+          ) : (
+            <div className="queue-list">
+              {queue.map((video, index) => (
+                <div key={index} className="queue-item" onDoubleClick={() => handlePlayFromQueue(index)}>
+                  <img src={video.thumbnail} alt={video.title} />
+                  <div className="queue-info">
+                    <p>{video.title}</p>
+                  </div>
+                  <div className="queue-item-actions">
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleRemoveFromQueue(index);
+                      }}
+                      className="btn-remove"
+                      title="Xóa khỏi danh sách"
+                    >
+                      ✖
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
         <div className="sidebar">
           <div className="users-section">
-            <h2>👥 Người trong room ({users.length})</h2>
+            <h2>Người trong room ({users.length})</h2>
             {users.length === 0 ? (
               <p className="empty-users">Chưa có người nào</p>
             ) : (
               <div className="users-list">
                 {users.map((user, index) => (
                   <div key={user.id || index} className="user-item">
-                    <span className="user-avatar">👤</span>
+                    <span className="user-avatar">●</span>
                     <span className="user-name">{user.username}</span>
                   </div>
                 ))}
@@ -1506,7 +1872,7 @@ function App() {
           </div>
 
           <div className="search-section">
-            <h2>🔍 Tìm kiếm</h2>
+            <h2>Tìm kiếm</h2>
             <form onSubmit={handleSearch} className="search-form">
               <input
                 type="text"
@@ -1535,33 +1901,9 @@ function App() {
                           onClick={(e) => handleAddToQueue(e, video)}
                           className="btn-small"
                         >
-                          ➕ Thêm vào queue
+                          + Danh sách phát
                         </button>
                       </div>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-
-          <div className="queue-section">
-            <h2>📋 Danh sách phát ({queue.length})</h2>
-            {queue.length === 0 ? (
-              <p className="empty-queue">Danh sách trống</p>
-            ) : (
-              <div className="queue-list">
-                {queue.map((video, index) => (
-                  <div key={index} className="queue-item" onDoubleClick={() => handlePlayFromQueue(index)}>
-                    <img src={video.thumbnail} alt={video.title} />
-                    <div className="queue-info">
-                      <p>{video.title}</p>
-                      <button
-                        onClick={() => handleRemoveFromQueue(index)}
-                        className="btn-remove"
-                      >
-                        ❌
-                      </button>
                     </div>
                   </div>
                 ))}

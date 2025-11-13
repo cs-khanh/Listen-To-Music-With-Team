@@ -41,6 +41,7 @@ class RoomState {
 
   addToQueue(video) {
     this.queue.push(video);
+    console.log('[ROOM-STATE] Video added to queue:', video.videoId, video.title, 'Queue length:', this.queue.length);
   }
 
   removeFromQueue(index) {
@@ -51,12 +52,16 @@ class RoomState {
   }
 
   nextVideo() {
+    console.log('[ROOM-STATE] nextVideo() called, queue length:', this.queue.length);
     if (this.queue.length > 0) {
-      this.currentVideo = this.queue.shift();
+      const next = this.queue.shift();
+      console.log('[ROOM-STATE] nextVideo() returning:', next.videoId, next.title, 'Remaining queue length:', this.queue.length);
+      this.currentVideo = next;
       this.currentTime = 0;
       this.lastUpdatedAt = Date.now();
-      return this.currentVideo;
+      return next;
     }
+    console.log('[ROOM-STATE] nextVideo() returning null - queue is empty');
     return null;
   }
 }
@@ -69,10 +74,15 @@ function getLiveCurrentTime(room) {
 }
 
 function startTicker(roomId) {
-  if (tickers.has(roomId)) return;
+  if (tickers.has(roomId)) {
+    console.log(`[SERVER] [TICKER] Ticker already running for room:`, roomId);
+    return;
+  }
+  console.log(`[SERVER] [TICKER] 🟢 Starting ticker for room:`, roomId);
   const interval = setInterval(() => {
     const room = rooms.get(roomId);
     if (!room) {
+      console.log(`[SERVER] [TICKER] ⚠️  Room not found, stopping ticker:`, roomId);
       stopTicker(roomId);
       return;
     }
@@ -87,6 +97,7 @@ function startTicker(roomId) {
     });
   }, 1000);
   tickers.set(roomId, interval);
+  console.log(`[SERVER] [TICKER] ✅ Ticker started for room:`, roomId);
 }
 
 function stopTicker(roomId) {
@@ -94,6 +105,9 @@ function stopTicker(roomId) {
   if (t) {
     clearInterval(t);
     tickers.delete(roomId);
+    console.log(`[SERVER] [TICKER] 🔴 Stopped ticker for room:`, roomId);
+  } else {
+    console.log(`[SERVER] [TICKER] ⚠️  No ticker found for room:`, roomId);
   }
 }
 
@@ -188,6 +202,11 @@ app.get('/api/search', async (req, res) => {
         break;
       } catch (err) {
         ytError = err;
+        // Ignore known transient youtube-sr parse errors and continue to retry/fallback
+        if (String(err?.message || '').includes('browseId')) {
+          results = [];
+          continue;
+        }
       }
     }
     if (!results || results.length === 0) {
@@ -222,8 +241,35 @@ app.get('/api/search', async (req, res) => {
 
     res.json(videos);
   } catch (error) {
-    console.error('Search error:', error);
-    res.status(500).json({ error: 'Failed to search videos', message: error.message });
+    // Final safety: try public fallback; if it also fails, return empty list to avoid UI error states
+    try {
+      const fallback = await (async () => {
+        try {
+          const { data } = await axios.get('https://piped.video/api/v1/search', {
+            params: { q, region: 'VN' },
+            timeout: 8000,
+          });
+          if (!Array.isArray(data)) return [];
+          return data
+            .filter((v) => v.type === 'video' && v.id)
+            .slice(0, 10)
+            .map((v) => ({
+              videoId: v.id,
+              title: v.title,
+              thumbnail: (v.thumbnails && v.thumbnails[0]?.url) || `https://img.youtube.com/vi/${v.id}/hqdefault.jpg`,
+              duration: v.duration,
+              channel: v.uploader || 'Unknown'
+            }));
+        } catch {
+          return [];
+        }
+      })();
+      console.warn('YouTube search failed, served via fallback:', error?.message);
+      return res.json(fallback);
+    } catch {
+      console.warn('Search failed and fallback unavailable:', error?.message);
+      return res.status(200).json([]);
+    }
   }
 });
 
@@ -469,45 +515,128 @@ io.on('connection', (socket) => {
 
   // Khi video kết thúc tự nhiên, leader thông báo để chuyển bài
   socket.on('video-ended', ({ roomId }) => {
-    console.log('[SERVER] video-ended received from', socket.id, 'room:', roomId);
+    const timestamp = new Date().toISOString();
+    console.log('\n[SERVER] ========== VIDEO-ENDED EVENT ==========');
+    console.log(`[SERVER] [${timestamp}] video-ended received from socket:`, socket.id, 'room:', roomId);
     const room = rooms.get(roomId);
     if (!room) {
-      console.log('[SERVER] video-ended: Room not found');
+      console.log(`[SERVER] [${timestamp}] ❌ video-ended: Room not found:`, roomId);
+      console.log('[SERVER] ===========================================\n');
       return;
     }
     if (socket.id !== room.leaderId) {
-      console.log('[SERVER] video-ended: Not leader, current leader:', room.leaderId);
+      console.log(`[SERVER] [${timestamp}] ❌ video-ended: Not leader!`, {
+        sender: socket.id,
+        currentLeader: room.leaderId,
+        roomId
+      });
+      console.log('[SERVER] ===========================================\n');
       return;
     }
-    console.log('[SERVER] video-ended: Queue length before next:', room.queue.length);
+    console.log(`[SERVER] [${timestamp}] ✅ video-ended: Valid leader, processing...`);
+    console.log(`[SERVER] [${timestamp}] Current video:`, {
+      videoId: room.currentVideo?.videoId,
+      title: room.currentVideo?.title,
+      currentTime: room.currentTime,
+      isPlaying: room.isPlaying
+    });
+    console.log(`[SERVER] [${timestamp}] Queue status:`, {
+      length: room.queue.length,
+      contents: room.queue.map(v => ({ id: v.videoId, title: v.title }))
+    });
+    
     const nextVideo = room.nextVideo();
     if (nextVideo) {
-      console.log('[SERVER] video-ended: Playing next video:', nextVideo.videoId, nextVideo.title);
+      console.log(`[SERVER] [${timestamp}] ✅ Next video found:`, {
+        videoId: nextVideo.videoId,
+        title: nextVideo.title,
+        remainingQueueLength: room.queue.length
+      });
       room.currentVideo = nextVideo;
       room.currentTime = 0;
       room.isPlaying = true;
       room.lastUpdatedAt = Date.now();
-      io.to(roomId).emit('video-play', {
+      
+      const videoPlayData = {
         videoId: nextVideo.videoId,
         title: nextVideo.title,
         thumbnail: nextVideo.thumbnail,
         currentTime: 0,
-        serverTs: Date.now()
+        serverTs: Date.now(),
+        isPlaying: true
+      };
+      
+      console.log(`[SERVER] [${timestamp}] 📤 Emitting video-play to room:`, roomId, {
+        videoId: videoPlayData.videoId,
+        title: videoPlayData.title,
+        isPlaying: videoPlayData.isPlaying,
+        currentTime: videoPlayData.currentTime
       });
+      
+      io.to(roomId).emit('video-play', videoPlayData);
       io.to(roomId).emit('queue-updated', { queue: room.queue });
+      
+      console.log(`[SERVER] [${timestamp}] 🎬 Starting ticker for room:`, roomId);
       startTicker(roomId);
+      
+      console.log(`[SERVER] [${timestamp}] ✅ Video-ended handled successfully`);
+      console.log('[SERVER] ===========================================\n');
     } else {
-      console.log('[SERVER] video-ended: No more videos in queue, stopping');
+      console.log(`[SERVER] [${timestamp}] ❌ No more videos in queue, stopping playback`);
       room.isPlaying = false;
       stopTicker(roomId);
+      console.log(`[SERVER] [${timestamp}] ⏹️  Playback stopped`);
+      console.log('[SERVER] ===========================================\n');
     }
   });
 
   socket.on('add-to-queue', ({ roomId, video }) => {
+    console.log('[SERVER] add-to-queue received from', socket.id, 'room:', roomId, 'video:', video?.videoId, video?.title);
     const room = rooms.get(roomId);
-    if (!room) return;
+    if (!room) {
+      console.log('[SERVER] add-to-queue: Room not found');
+      return;
+    }
+    
+    // Kiểm tra xem video đã có trong queue hoặc đang phát chưa
+    const isInQueue = room.queue.some(v => v.videoId === video.videoId);
+    const isCurrentVideo = room.currentVideo && room.currentVideo.videoId === video.videoId;
+    
+    if (isInQueue) {
+      console.log('[SERVER] add-to-queue: Video already in queue, skipping:', video.videoId);
+      return;
+    }
+    
+    if (isCurrentVideo) {
+      console.log('[SERVER] add-to-queue: Video is currently playing, skipping:', video.videoId);
+      return;
+    }
     
     room.addToQueue(video);
+    console.log('[SERVER] add-to-queue: Video added, queue length:', room.queue.length, 'Current video:', room.currentVideo?.videoId);
+    
+    // Nếu chưa có video nào đang phát, tự động phát video đầu tiên trong queue
+    if (!room.currentVideo && room.queue.length > 0) {
+      console.log('[SERVER] add-to-queue: No current video, auto-playing first video in queue');
+      const nextVideo = room.nextVideo();
+      if (nextVideo) {
+        room.currentVideo = nextVideo;
+        room.currentTime = 0;
+        room.isPlaying = true;
+        room.lastUpdatedAt = Date.now();
+        console.log('[SERVER] add-to-queue: Auto-playing video:', nextVideo.videoId, nextVideo.title);
+        io.to(roomId).emit('video-play', {
+          videoId: nextVideo.videoId,
+          title: nextVideo.title,
+          thumbnail: nextVideo.thumbnail,
+          currentTime: 0,
+          serverTs: Date.now(),
+          isPlaying: true
+        });
+        startTicker(roomId);
+      }
+    }
+    
     io.to(roomId).emit('queue-updated', { queue: room.queue });
   });
 
